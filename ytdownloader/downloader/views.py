@@ -1,7 +1,6 @@
-from django.shortcuts import render
 from django.shortcuts import render, redirect
 from django.http import StreamingHttpResponse, HttpResponse
-from pytube import YouTube, Playlist
+import yt_dlp
 from urllib.parse import urlparse, parse_qs
 import tempfile
 import zipfile
@@ -25,23 +24,31 @@ def home(request):
         playlist_id = query_params.get('list', [None])[0]
         index = query_params.get('index', [1])[0]  # Default to 1 if not provided
 
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+        }
+
         if playlist_id:
             # Playlist mode
             playlist_url = f"https://www.youtube.com/playlist?list={playlist_id}"
             try:
-                playlist = Playlist(playlist_url)
-                videos = []
-                for idx, video in enumerate(playlist.videos, start=1):
-                    videos.append({
-                        'index': idx,
-                        'title': video.title,
-                        'thumbnail_url': video.thumbnail_url,
-                        'video_id': video.video_id,
-                        'highlighted': idx == int(index)  # Highlight based on URL index
-                    })
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    playlist_info = ydl.extract_info(playlist_url, download=False)
+                    videos = []
+                    entries = playlist_info.get('entries', [])
+                    for idx, entry in enumerate(entries, start=1):
+                        if entry:  # Skip None entries
+                            videos.append({
+                                'index': idx,
+                                'title': entry.get('title', 'Unknown'),
+                                'thumbnail_url': entry.get('thumbnail'),
+                                'video_id': entry.get('id'),
+                                'highlighted': idx == int(index)  # Highlight based on URL index
+                            })
                 return render(request, 'downloader/home.html', {
                     'is_playlist': True,
-                    'playlist_title': playlist.title,
+                    'playlist_title': playlist_info.get('title', 'Unknown Playlist'),
                     'videos': videos,
                     'url': url
                 })
@@ -50,13 +57,22 @@ def home(request):
         elif video_id:
             # Single video mode
             try:
-                video = YouTube(url)
-                streams = video.streams.filter(progressive=True, file_extension='mp4').order_by('resolution').desc()
-                resolutions = [stream.resolution for stream in streams]
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    video_info = ydl.extract_info(url, download=False)
+                    formats = video_info.get('formats', [])
+                    # Filter for progressive MP4 streams (video+audio merged)
+                    progressive_mp4s = [
+                        f for f in formats
+                        if f.get('vcodec') != 'none' and f.get('acodec') != 'none'
+                        and f.get('ext') == 'mp4' and f.get('height') is not None
+                    ]
+                    # Sort by height descending
+                    progressive_mp4s.sort(key=lambda f: f.get('height', 0), reverse=True)
+                    resolutions = [f"{f.get('height')}p" for f in progressive_mp4s]
                 return render(request, 'downloader/home.html', {
                     'is_video': True,
-                    'title': video.title,
-                    'thumbnail_url': video.thumbnail_url,
+                    'title': video_info.get('title', 'Unknown'),
+                    'thumbnail_url': video_info.get('thumbnail'),
                     'video_id': video_id,
                     'resolutions': resolutions,
                     'url': url
@@ -71,32 +87,55 @@ def home(request):
 def download_video(request, video_id):
     resolution = request.GET.get('resolution', 'highest')  # Default to highest
     try:
-        video = YouTube(f"https://www.youtube.com/watch?v={video_id}")
-        if resolution == 'highest':
-            stream = video.streams.get_highest_resolution()
-        else:
-            stream = video.streams.filter(res=resolution, progressive=True, file_extension='mp4').first()
-        
-        if not stream:
-            return HttpResponse('No stream found for this resolution', status=404)
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'outtmpl': '%(title)s.%(ext)s',
+        }
+        if resolution != 'highest':
+            height = int(resolution.replace('p', ''))
+            ydl_opts['format'] = f'best[height<={height}][ext=mp4]/best[ext=mp4]'
 
-        # Download to temp file
+        downloaded_path = None
+        def progress_hook(d):
+            if d['status'] == 'finished':
+                nonlocal downloaded_path
+                downloaded_path = d['filename']
+
+        ydl_opts['progress_hooks'] = [progress_hook]
+
         with tempfile.TemporaryDirectory() as tmpdir:
-            filepath = stream.download(output_path=tmpdir, filename=sanitize_filename(f"{video.title}.mp4"))
-            with open(filepath, 'rb') as f:
+            ydl_opts['outtmpl'] = os.path.join(tmpdir, '%(title)s.%(ext)s')
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+
+            if not downloaded_path or not os.path.exists(downloaded_path):
+                return HttpResponse('Download failed: No file found', status=404)
+
+            with open(downloaded_path, 'rb') as f:
                 response = StreamingHttpResponse(f.read(), content_type='video/mp4')
-                response['Content-Disposition'] = f'attachment; filename="{os.path.basename(filepath)}"'
+                response['Content-Disposition'] = f'attachment; filename="{os.path.basename(downloaded_path)}"'
                 return response
     except Exception as e:
         return HttpResponse(f'Error downloading video: {str(e)}', status=500)
 
 def download_thumbnail(request, video_id):
     try:
-        video = YouTube(f"https://www.youtube.com/watch?v={video_id}")
-        thumbnail_url = video.thumbnail_url
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            video_info = ydl.extract_info(url, download=False)
+            thumbnail_url = video_info.get('thumbnail')
+            title = video_info.get('title', 'Unknown')
+        if not thumbnail_url:
+            return HttpResponse('No thumbnail available', status=404)
         thumbnail_data = requests.get(thumbnail_url).content
         response = HttpResponse(thumbnail_data, content_type='image/jpeg')
-        response['Content-Disposition'] = f'attachment; filename="{sanitize_filename(video.title)}_thumbnail.jpg"'
+        response['Content-Disposition'] = f'attachment; filename="{sanitize_filename(title)}_thumbnail.jpg"'
         return response
     except Exception as e:
         return HttpResponse(f'Error downloading thumbnail: {str(e)}', status=500)
@@ -115,15 +154,29 @@ def download_playlist(request):
 
         # For videos or all (zip)
         try:
+            urls = [f"https://www.youtube.com/watch?v={vid}" for vid in selected_videos]
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'format': 'best[ext=mp4]',
+                'outtmpl': '%(title)s.%(ext)s',
+            }
+
             with tempfile.TemporaryDirectory() as tmpdir:
+                ydl_opts['outtmpl'] = os.path.join(tmpdir, '%(title)s.%(ext)s')
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download(urls)
+
+                # Find all downloaded MP4 files in tmpdir
+                video_files = [f for f in os.listdir(tmpdir) if f.endswith('.mp4')]
+                if not video_files:
+                    return HttpResponse('No videos downloaded', status=404)
+
                 zip_path = os.path.join(tmpdir, 'playlist.zip')
                 with zipfile.ZipFile(zip_path, 'w') as zipf:
-                    for video_id in selected_videos:
-                        video = YouTube(f"https://www.youtube.com/watch?v={video_id}")
-                        stream = video.streams.get_highest_resolution()
-                        video_path = stream.download(output_path=tmpdir, filename=sanitize_filename(f"{video.title}.mp4"))
-                        zipf.write(video_path, os.path.basename(video_path))
-                        os.remove(video_path)  # Clean up temp video
+                    for video_file in video_files:
+                        video_path = os.path.join(tmpdir, video_file)
+                        zipf.write(video_path, video_file)
 
                 with open(zip_path, 'rb') as f:
                     response = StreamingHttpResponse(f.read(), content_type='application/zip')
@@ -133,5 +186,3 @@ def download_playlist(request):
             return HttpResponse(f'Error downloading playlist: {str(e)}', status=500)
 
     return redirect('home')
-
-# Create your views here.
