@@ -1,0 +1,59 @@
+{% extends 'downloader/base.html' %}
+
+{% block content %}
+<h1 class="text-center">YouTube Video/Playlist Downloader</h1>
+
+<form method="post" class="mb-4">
+    {% csrf_token %}
+    <div class="input-group">
+        <input type="text" name="url" class="form-control" placeholder="Paste YouTube URL" value="{{ url|default:'' }}">
+        <button type="submit" class="btn btn-primary">Submit</button>
+    </div>
+</form>
+
+{% if error %}
+<div class="alert alert-danger">{{ error }}</div>
+{% endif %}
+
+{% if is_video %}
+<div class="card mb-4">
+    <img src="{{ thumbnail_url }}" class="card-img-top" alt="Thumbnail">
+    <div class="card-body">
+        <h5 class="card-title">{{ title }}</h5>
+        <a href="{% url 'download_thumbnail' video_id %}" class="btn btn-secondary btn-sm">Download Thumbnail</a>
+        <div class="mt-2">
+            {% for res in resolutions %}
+            <a href="{% url 'download_video' video_id %}?resolution={{ res }}" class="btn btn-primary btn-sm m-1">{{ res }}</a>
+            {% endfor %}
+            <a href="{% url 'download_video' video_id %}" class="btn btn-success btn-sm m-1">Highest</a>
+        </div>
+    </div>
+</div>
+{% endif %}
+
+{% if is_playlist %}
+<h2>{{ playlist_title }}</h2>
+<form method="post" action="{% url 'download_playlist' %}">
+    {% csrf_token %}
+    <div class="row">
+        {% for video in videos %}
+        <div class="col-md-4 mb-3">
+            <div class="card {% if video.highlighted %}border-primary{% endif %}">
+                <img src="{{ video.thumbnail_url }}" class="card-img-top" alt="Thumbnail">
+                <div class="card-body">
+                    <h6 class="card-title">{{ video.index }}. {{ video.title }}</h6>
+                    <div class="form-check">
+                        <input class="form-check-input" type="checkbox" name="selected_videos" value="{{ video.video_id }}" id="vid{{ video.index }}">
+                        <label class="form-check-label" for="vid{{ video.index }}">Select</label>
+                    </div>
+                    <a href="{% url 'download_thumbnail' video.video_id %}" class="btn btn-outline-secondary btn-sm mt-1">Thumb</a>
+                    <a href="{% url 'download_video' video.video_id %}" class="btn btn-outline-primary btn-sm mt-1">Video</a>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    <button type="submit" name="action" value="all_videos_zip" class="btn btn-success">Download Selected (ZIP)</button>
+</form>
+{% endif %}
+{% endblock %}
